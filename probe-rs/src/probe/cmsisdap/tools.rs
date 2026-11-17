@@ -490,11 +490,14 @@ fn is_known_cmsis_dap_dev(device: &DeviceInfo) -> bool {
 
 /// Whether the probe loses replies when it gets more than one request at a time.
 ///
+/// ESP32JTAG CMSIS-DAP advertises eight packet buffers, but sustained pipelined
+/// `DAP_TransferBlock` reads can lose replies and leave the target unresponsive.
+///
 /// XDS110 firmware 3.0.0.22 reports 64 packet buffers, but drops some of the replies to parallel
 /// `DAP_TransferBlock` reads. Firmware 3.0.0.45 keeps all of them. The XDS110 shows its firmware
 /// version in the product string, for example "XDS110 (03.00.00.22) Embed with CMSIS-DAP".
 pub(super) fn loses_pipelined_replies(product: &str) -> bool {
-    if product == "IFMCU CMSIS-DAP" {
+    if matches!(product, "IFMCU CMSIS-DAP" | "ESP32JTAG CMSIS-DAP") {
         return true;
     }
 
@@ -527,5 +530,10 @@ mod tests {
             "XDS110 (03.00.00.45) Embed with CMSIS-DAP"
         ));
         assert!(!loses_pipelined_replies("DAPLink CMSIS-DAP"));
+    }
+
+    #[test]
+    fn esp32jtag_loses_pipelined_replies() {
+        assert!(loses_pipelined_replies("ESP32JTAG CMSIS-DAP"));
     }
 }
