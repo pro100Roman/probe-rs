@@ -59,6 +59,7 @@ pub struct Session {
     interfaces: ArchitectureInterface,
     cores: Vec<CombinedCoreState>,
     configured_trace_sink: Option<TraceSink>,
+    clear_hw_breakpoints_on_drop: bool,
 }
 
 /// The `SessionConfig` struct is used to configure a new `Session` during auto-attach.
@@ -190,6 +191,7 @@ impl Session {
         attach_method: AttachMethod,
         permissions: Permissions,
         registry: &Registry,
+        clear_hw_breakpoints: bool,
     ) -> Result<Self, Error> {
         let (probe, target) = get_target_from_selector(target, attach_method, probe, registry)?;
 
@@ -210,12 +212,28 @@ impl Session {
         // Use ARM DAP path when the target connects via SWD/DAP: either ARM cores or RISC-V cores
         // over mem-AP (e.g. RP235x_riscv).
         let mut session = if target.uses_arm_debug_interface() {
-            Self::attach_arm_debug_interface(probe, target, attach_method, permissions, cores)?
+            Self::attach_arm_debug_interface(
+                probe,
+                target,
+                attach_method,
+                permissions,
+                cores,
+                clear_hw_breakpoints,
+            )?
         } else {
-            Self::attach_jtag(probe, target, attach_method, permissions, cores)?
+            Self::attach_jtag(
+                probe,
+                target,
+                attach_method,
+                permissions,
+                cores,
+                clear_hw_breakpoints,
+            )?
         };
 
-        session.clear_all_hw_breakpoints()?;
+        if clear_hw_breakpoints {
+            session.clear_all_hw_breakpoints()?;
+        }
 
         Ok(session)
     }
@@ -226,6 +244,7 @@ impl Session {
         attach_method: AttachMethod,
         permissions: Permissions,
         cores: Vec<CombinedCoreState>,
+        clear_hw_breakpoints: bool,
     ) -> Result<Self, Error> {
         let default_core = target.default_core();
 
@@ -350,6 +369,7 @@ impl Session {
                 interfaces,
                 cores,
                 configured_trace_sink: None,
+                clear_hw_breakpoints_on_drop: clear_hw_breakpoints,
             };
 
             {
@@ -392,6 +412,7 @@ impl Session {
                 interfaces,
                 cores,
                 configured_trace_sink: None,
+                clear_hw_breakpoints_on_drop: clear_hw_breakpoints,
             })
         }
     }
@@ -442,6 +463,7 @@ impl Session {
         _attach_method: AttachMethod,
         _permissions: Permissions,
         cores: Vec<CombinedCoreState>,
+        clear_hw_breakpoints: bool,
     ) -> Result<Self, Error> {
         // While we still don't support mixed architectures
         // (they'd need per-core debug sequences), we can at least
@@ -546,6 +568,7 @@ impl Session {
             interfaces,
             cores,
             configured_trace_sink: None,
+            clear_hw_breakpoints_on_drop: clear_hw_breakpoints,
         };
 
         // Connect to the cores
@@ -1140,11 +1163,13 @@ const _: fn() = || {
 impl Drop for Session {
     #[tracing::instrument(name = "session_drop", skip(self))]
     fn drop(&mut self) {
-        if let Err(err) = self.clear_all_hw_breakpoints() {
-            tracing::warn!(
-                "Could not clear all hardware breakpoints: {:?}",
-                anyhow::anyhow!(err)
-            );
+        if self.clear_hw_breakpoints_on_drop {
+            if let Err(err) = self.clear_all_hw_breakpoints() {
+                tracing::warn!(
+                    "Could not clear all hardware breakpoints: {:?}",
+                    anyhow::anyhow!(err)
+                );
+            }
         }
 
         // Call any necessary deconfiguration/shutdown hooks.

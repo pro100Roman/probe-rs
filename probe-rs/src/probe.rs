@@ -446,6 +446,27 @@ impl Probe {
         self.attach_with_registry(target, permissions, &registry)
     }
 
+    /// Attach to the chip without halting its cores to clear hardware breakpoints.
+    ///
+    /// This is intended for non-invasive trace sessions on timing-sensitive targets. Unlike
+    /// [`Probe::attach`], this preserves any hardware breakpoints which were configured before
+    /// the session and does not clear them when the session is dropped.
+    pub fn attach_without_breakpoint_cleanup(
+        self,
+        target: impl Into<TargetSelector>,
+        permissions: Permissions,
+    ) -> Result<Session, Error> {
+        let registry = Registry::from_builtin_families();
+        Session::new(
+            self,
+            target.into(),
+            AttachMethod::Normal,
+            permissions,
+            &registry,
+            false,
+        )
+    }
+
     /// Attach to the chip.
     ///
     /// This runs all the necessary protocol init routines.
@@ -464,6 +485,7 @@ impl Probe {
             AttachMethod::Normal,
             permissions,
             registry,
+            true,
         )
     }
 
@@ -558,6 +580,7 @@ impl Probe {
             AttachMethod::UnderReset,
             permissions,
             registry,
+            true,
         )
         .map_err(|e| match e {
             Error::Arm(ArmError::Timeout)
