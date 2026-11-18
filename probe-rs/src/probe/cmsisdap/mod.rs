@@ -78,6 +78,8 @@ use super::common::{ScanChainError, extract_idcodes, extract_ir_lengths};
 #[derive(Debug)]
 pub struct CmsisDapFactory;
 
+const ESP32JTAG_PRODUCT: &str = "ESP32JTAG CMSIS-DAP";
+
 impl std::fmt::Display for CmsisDapFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CMSIS-DAP")
@@ -98,27 +100,17 @@ impl ProbeFactory for CmsisDapFactory {
                     max_packet_size: 1024,
                     timeout: commands::DEFAULT_USB_TIMEOUT,
                 },
-                None,
+                // CMSIS-DAP TCP has no USB descriptor from which probe-rs can learn the product.
+                // WaveCraft's TCP endpoint is provided by ESP32JTAG, so carry that identity into
+                // the same compatibility path used by its USB interface.
+                Some(ESP32JTAG_PRODUCT.to_owned()),
             ),
             None => tools::open_device_from_selector(selector)?,
         };
 
         let mut dap = CmsisDap::new_from_device(device)?;
         if let Some(product) = product {
-            if tools::loses_pipelined_replies(&product) {
-                tracing::warn!(
-                    "{product}: this firmware loses replies to parallel requests. \
-                     probe-rs sends one request at a time. Update the firmware for faster transfers."
-                );
-                dap.packet_count = 1;
-            }
-            if tools::avoids_transfer_block(&product) {
-                tracing::warn!(
-                    "{product}: this firmware is incompatible with DAP_TransferBlock. \
-                     probe-rs uses DAP_Transfer instead."
-                );
-                dap.use_transfer_block = false;
-            }
+            dap.apply_product_quirks(&product);
         }
 
         Ok(DebugProbe::into_probe(Box::new(dap)))
@@ -183,6 +175,7 @@ pub struct CmsisDap {
     packet_size: u16,
     packet_count: u8,
     use_transfer_block: bool,
+    transfer_idle_cycles: u8,
     capabilities: Capabilities,
     swo_buffer_size: Option<usize>,
     swo_active: bool,
@@ -211,6 +204,7 @@ impl std::fmt::Debug for CmsisDap {
             .field("protocol", &self.protocol)
             .field("packet_size", &self.packet_size)
             .field("packet_count", &self.packet_count)
+            .field("transfer_idle_cycles", &self.transfer_idle_cycles)
             .field("capabilities", &self.capabilities)
             .field("swo_buffer_size", &self.swo_buffer_size)
             .field("swo_active", &self.swo_active)
@@ -236,6 +230,29 @@ struct ProbeInfo {
 }
 
 impl CmsisDap {
+    fn apply_product_quirks(&mut self, product: &str) {
+        if tools::loses_pipelined_replies(product) {
+            tracing::warn!(
+                "{product}: this firmware loses replies to parallel requests. \
+                 probe-rs sends one request at a time. Update the firmware for faster transfers."
+            );
+            self.packet_count = 1;
+        }
+        if tools::avoids_transfer_block(product) {
+            tracing::warn!(
+                "{product}: this firmware is incompatible with DAP_TransferBlock. \
+                 probe-rs uses DAP_Transfer instead."
+            );
+            self.use_transfer_block = false;
+        }
+        if let Some(idle_cycles) = tools::transfer_idle_cycles(product) {
+            tracing::warn!(
+                "{product}: probe-rs inserts {idle_cycles} idle SWD clock cycles after each transfer."
+            );
+            self.transfer_idle_cycles = idle_cycles;
+        }
+    }
+
     fn new_from_device(mut device: CmsisDapDevice) -> Result<Self, DebugProbeError> {
         // Discard anything left in buffer, as otherwise
         // we'll get out of sync between requests and responses.
@@ -276,6 +293,7 @@ impl CmsisDap {
             packet_count,
             packet_size,
             use_transfer_block: true,
+            transfer_idle_cycles: 0,
             capabilities: caps,
             swo_buffer_size,
             swo_active: false,
@@ -1007,7 +1025,7 @@ impl DebugProbe for CmsisDap {
         self.set_speed(self.speed_khz)?;
 
         self.transfer_configure(ConfigureRequest {
-            idle_cycles: 0,
+            idle_cycles: self.transfer_idle_cycles,
             wait_retry: 0xffff,
             match_retry: 0,
         })?;
@@ -1315,7 +1333,8 @@ mod tests {
     };
     use super::commands::{Request, general::info::PacketSizeCommand};
     use super::{
-        CapabilitiesCommand, CmsisDap, HostStatusResponse, PacketCountCommand, VendorCommandId,
+        CapabilitiesCommand, CmsisDap, ESP32JTAG_PRODUCT, HostStatusResponse, PacketCountCommand,
+        VendorCommandId,
     };
     use crate::probe::DebugProbeError;
 
@@ -1424,6 +1443,18 @@ mod tests {
 
         let probe: &mut dyn Any = interface.driver_mut().unwrap();
         assert!(probe.downcast_mut::<CmsisDap>().is_some());
+    }
+
+    #[test]
+    fn esp32jtag_quirks_avoid_block_transfers_and_leave_swd_idle_cycles() {
+        let probe = FakeProbe::shared(64, |command| standard_reply(command, 64, 8));
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe)).unwrap();
+
+        dap.apply_product_quirks(ESP32JTAG_PRODUCT);
+
+        assert!(!dap.use_transfer_block);
+        assert_eq!(dap.transfer_idle_cycles, 8);
+        assert_eq!(dap.packet_count, 8);
     }
 
     #[test]
