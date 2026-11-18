@@ -79,6 +79,9 @@ use super::common::{ScanChainError, extract_idcodes, extract_ir_lengths};
 pub struct CmsisDapFactory;
 
 const ESP32JTAG_PRODUCT: &str = "ESP32JTAG CMSIS-DAP";
+/// Largest TCP packet that still lets 24 commands drain an 8 KiB RTT window in one 32-packet
+/// firmware queue. Larger packets reduce the command count but exceed the ESP32 TCP send window.
+const TCP_PACKET_SIZE_LIMIT: u16 = 576;
 
 impl std::fmt::Display for CmsisDapFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -255,7 +258,11 @@ impl CmsisDap {
         // answer nothing at all until they receive a full one, which is what the retrying inside
         // here is for. Anything sent before it can go unanswered on those probes for reasons that
         // have nothing to do with the probe's state.
-        let packet_size = device.find_packet_size()? as u16;
+        let mut packet_size = device.find_packet_size()? as u16;
+        if device.is_tcp() {
+            packet_size = packet_size.min(TCP_PACKET_SIZE_LIMIT);
+            device.set_packet_size(packet_size as usize);
+        }
 
         // A probe that still owes replies from an earlier session answers the start of this one
         // with the previous one's data. Drain properly, prompt out what it is holding, and ask

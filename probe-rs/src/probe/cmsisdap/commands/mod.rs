@@ -227,6 +227,10 @@ pub enum CmsisDapDevice {
 }
 
 impl CmsisDapDevice {
+    pub(super) fn is_tcp(&self) -> bool {
+        matches!(self, Self::Tcp { .. })
+    }
+
     fn usb_timeout(&self) -> Duration {
         match self {
             #[cfg(feature = "cmsisdap_v1")]

@@ -40,6 +40,10 @@ const MIN_BLOCK_TRANSFERS: usize = 2;
 /// the wait is already covered and a deeper queue only holds more requests in memory.
 const MAX_PIPELINED_BLOCKS: usize = 8;
 
+/// TCP has a much longer round trip than USB, so keep enough commands in flight to cover a full
+/// 8 KiB RTT ring-buffer drain when the probe advertises the corresponding queue depth.
+const MAX_PIPELINED_TCP_COMMANDS: usize = 32;
+
 /// Return how many words one `DAP_TransferBlock` packet holds.
 pub(crate) fn block_words_per_packet(packet_size: u16) -> usize {
     // A packet holds a one byte HID report id, the command id, the DAP index,
@@ -210,6 +214,81 @@ impl PendingBatch {
     }
 }
 
+enum PendingTcpCommand {
+    Transfers(PendingBatch),
+    Block {
+        start: usize,
+        len: usize,
+        direction: Direction,
+        request: TransferBlockRequest,
+    },
+}
+
+/// Lower one consecutive transfer segment to the CMSIS-DAP commands sent over TCP.
+///
+/// Unlike the USB path, the resulting commands are kept together so several TAR setup packets
+/// and their block transfers can share one network round trip.
+fn tcp_transfer_commands(
+    ops: &[(HandleId, SwdOp)],
+    batch_start: usize,
+    dap_index: u8,
+    packet_size: u16,
+) -> Vec<PendingTcpCommand> {
+    let mut commands = Vec::new();
+    let mut offset = 0;
+    let words_per_packet = block_words_per_packet(packet_size);
+
+    while offset < ops.len() {
+        let packets: Vec<_> =
+            split_into_packets(&ops[offset..], batch_start + offset, dap_index, packet_size)
+                .collect();
+        let packed = packets
+            .iter()
+            .map(|packet| packet.transfers.len())
+            .sum::<usize>();
+        commands.extend(packets.into_iter().map(PendingTcpCommand::Transfers));
+        offset += packed;
+        if offset == ops.len() {
+            break;
+        }
+
+        let run = run_length(ops, offset);
+        debug_assert!(run >= MIN_BLOCK_TRANSFERS);
+        let SwdOp::Transfer {
+            port,
+            addr,
+            direction,
+            ..
+        } = ops[offset].1
+        else {
+            unreachable!("a TCP transfer segment contains only transfers")
+        };
+        let address = CmsisDap::swd_register(port, addr);
+        for (chunk_index, chunk) in ops[offset..offset + run]
+            .chunks(words_per_packet)
+            .enumerate()
+        {
+            let mut request = match direction {
+                Direction::Read => TransferBlockRequest::read_request(address, chunk.len() as u16),
+                Direction::Write => TransferBlockRequest::write_request(
+                    address,
+                    chunk.iter().map(|(_, op)| transfer_data(op)).collect(),
+                ),
+            };
+            request.dap_index = dap_index;
+            commands.push(PendingTcpCommand::Block {
+                start: batch_start + offset + chunk_index * words_per_packet,
+                len: chunk.len(),
+                direction,
+                request,
+            });
+        }
+        offset += run;
+    }
+
+    commands
+}
+
 impl CmsisDap {
     fn swd_register(port: Port, addr: u8) -> RegisterAddress {
         match port {
@@ -332,6 +411,138 @@ impl CmsisDap {
 
     fn max_words_per_block_packet(&self) -> usize {
         block_words_per_packet(self.packet_size)
+    }
+
+    fn run_tcp_transfers(
+        &mut self,
+        ops: &[(HandleId, SwdOp)],
+        start: usize,
+        end: usize,
+        mut results: Results,
+    ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
+        let dap_index = self.jtag_state.chain_params.index as u8;
+        let commands = tcp_transfer_commands(&ops[start..end], start, dap_index, self.packet_size);
+        let depth = (self.packet_count as usize)
+            .saturating_sub(1)
+            .clamp(1, MAX_PIPELINED_TCP_COMMANDS);
+        let mut sent = 0;
+        let mut received = 0;
+
+        while received < commands.len() {
+            while sent < commands.len() && sent - received < depth {
+                let send_result = match &commands[sent] {
+                    PendingTcpCommand::Transfers(packet) => {
+                        commands::send_request(&mut self.device, &packet.request)
+                    }
+                    PendingTcpCommand::Block { request, .. } => {
+                        commands::send_request(&mut self.device, request)
+                    }
+                };
+                if let Err(error) = send_result {
+                    if sent != received {
+                        self.device.resynchronise();
+                    }
+                    let fault_operation = match &commands[sent] {
+                        PendingTcpCommand::Transfers(packet) => packet.transfers[0].batch_index,
+                        PendingTcpCommand::Block { start, .. } => *start,
+                    };
+                    return Err(BatchExecutionError::new_from_debug_probe_at(
+                        DebugProbeError::from(error),
+                        results,
+                        fault_operation,
+                    ));
+                }
+                sent += 1;
+            }
+
+            match &commands[received] {
+                PendingTcpCommand::Transfers(packet) => {
+                    let response =
+                        match commands::receive_response(&mut self.device, &packet.request) {
+                            Ok(response) => response,
+                            Err(error) => {
+                                self.device.resynchronise();
+                                return Err(BatchExecutionError::new_from_debug_probe_at(
+                                    DebugProbeError::from(error),
+                                    results,
+                                    packet.transfers[0].batch_index,
+                                ));
+                            }
+                        };
+                    if let Err((error, fault_operation)) =
+                        Self::classify_transfer_response(&response, &packet.transfers)
+                    {
+                        self.device.resynchronise();
+                        self.recover_from_block_error(&error);
+                        return Err(BatchExecutionError {
+                            error,
+                            results,
+                            fault_operation,
+                        });
+                    }
+                    for (transfer, response_transfer) in
+                        packet.transfers.iter().zip(response.transfers.iter())
+                    {
+                        if transfer.direction != Direction::Read || !transfer.id.should_capture() {
+                            continue;
+                        }
+                        let Some(data) = response_transfer.data else {
+                            self.device.resynchronise();
+                            return Err(BatchExecutionError::new_from_debug_probe_at(
+                                DebugProbeError::Other(
+                                    "CMSIS-DAP read did not return any data".to_string(),
+                                ),
+                                results,
+                                transfer.batch_index,
+                            ));
+                        };
+                        results.push(&transfer.id, CommandResult::U32(data));
+                    }
+                }
+                PendingTcpCommand::Block {
+                    start: chunk_start,
+                    len,
+                    direction,
+                    request,
+                } => {
+                    let response = match commands::receive_response(&mut self.device, request) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            self.device.resynchronise();
+                            return Err(BatchExecutionError::new_from_debug_probe_at(
+                                DebugProbeError::from(error),
+                                results,
+                                *chunk_start,
+                            ));
+                        }
+                    };
+                    if let Err((error, fault_operation)) =
+                        Self::classify_block_response(&response, *len, *chunk_start)
+                    {
+                        self.device.resynchronise();
+                        self.recover_from_block_error(&error);
+                        return Err(BatchExecutionError {
+                            error,
+                            results,
+                            fault_operation,
+                        });
+                    }
+                    if *direction == Direction::Read {
+                        for ((id, _), value) in ops[*chunk_start..*chunk_start + *len]
+                            .iter()
+                            .zip(response.transfer_data.iter())
+                        {
+                            if id.should_capture() {
+                                results.push(id, CommandResult::U32(*value));
+                            }
+                        }
+                    }
+                }
+            }
+            received += 1;
+        }
+
+        Ok(results)
     }
 
     /// Classify one `DAP_TransferBlock` reply.
@@ -593,6 +804,19 @@ impl SwdProbe for CmsisDap {
 
         let mut batch_index = 0;
         while batch_index < ops.len() {
+            if self.device.is_tcp() {
+                let transfer_count = ops[batch_index..]
+                    .iter()
+                    .take_while(|(_, op)| matches!(op, SwdOp::Transfer { .. }))
+                    .count();
+                if transfer_count != 0 {
+                    let end = batch_index + transfer_count;
+                    results = self.run_tcp_transfers(&ops, batch_index, end, results)?;
+                    batch_index = end;
+                    continue;
+                }
+            }
+
             let packets = split_into_packets(
                 &ops[batch_index..],
                 batch_index,
@@ -996,6 +1220,65 @@ mod tests {
         // per-transfer path spends on a request byte per word.
         for packet_size in [64u16, 512, 1024] {
             assert!(block_words_per_packet(packet_size) > transfers_that_fit(RW::W, packet_size));
+        }
+    }
+
+    #[test]
+    fn tcp_commands_pipeline_eight_rtt_windows_in_one_firmware_queue() {
+        let windows = 8;
+        let reads_per_window = 256;
+        let packet_size = 576;
+        let words_per_packet = block_words_per_packet(packet_size);
+        assert_eq!(words_per_packet, 142);
+
+        let mut ops = Vec::new();
+        for window in 0..windows {
+            ops.push(transfer(
+                Port::Ap,
+                0b0100,
+                Direction::Write,
+                0x2000_0000 + (window * 1024) as u32,
+            ));
+            ops.extend(
+                (0..reads_per_window).map(|_| transfer(Port::Ap, 0b1100, Direction::Read, 0)),
+            );
+        }
+
+        let batch_start = 17;
+        let commands = tcp_transfer_commands(&ops, batch_start, 3, packet_size);
+        assert_eq!(commands.len(), windows * 3);
+        assert!(commands.len() <= MAX_PIPELINED_TCP_COMMANDS);
+
+        for (window, commands) in commands.chunks_exact(3).enumerate() {
+            let start = batch_start + window * (reads_per_window + 1);
+            let PendingTcpCommand::Transfers(setup) = &commands[0] else {
+                panic!("RTT window must start with its TAR setup transfer");
+            };
+            assert_eq!(setup.transfers.len(), 1);
+            assert_eq!(setup.transfers[0].batch_index, start);
+
+            for (command, expected_start, expected_len) in [
+                (&commands[1], start + 1, words_per_packet),
+                (
+                    &commands[2],
+                    start + 1 + words_per_packet,
+                    reads_per_window - words_per_packet,
+                ),
+            ] {
+                let PendingTcpCommand::Block {
+                    start,
+                    len,
+                    direction,
+                    request,
+                } = command
+                else {
+                    panic!("RTT payload must use DAP_TransferBlock");
+                };
+                assert_eq!(*start, expected_start);
+                assert_eq!(*len, expected_len);
+                assert_eq!(*direction, Direction::Read);
+                assert_eq!(request.dap_index, 3);
+            }
         }
     }
 
