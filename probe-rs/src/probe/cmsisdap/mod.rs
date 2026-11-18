@@ -104,14 +104,21 @@ impl ProbeFactory for CmsisDapFactory {
         };
 
         let mut dap = CmsisDap::new_from_device(device)?;
-        if let Some(product) = product
-            && tools::loses_pipelined_replies(&product)
-        {
-            tracing::warn!(
-                "{product}: this firmware loses replies to parallel requests. \
-                 probe-rs sends one request at a time. Update the firmware for faster transfers."
-            );
-            dap.packet_count = 1;
+        if let Some(product) = product {
+            if tools::loses_pipelined_replies(&product) {
+                tracing::warn!(
+                    "{product}: this firmware loses replies to parallel requests. \
+                     probe-rs sends one request at a time. Update the firmware for faster transfers."
+                );
+                dap.packet_count = 1;
+            }
+            if tools::avoids_transfer_block(&product) {
+                tracing::warn!(
+                    "{product}: this firmware is incompatible with DAP_TransferBlock. \
+                     probe-rs uses DAP_Transfer instead."
+                );
+                dap.use_transfer_block = false;
+            }
         }
 
         Ok(DebugProbe::into_probe(Box::new(dap)))
@@ -175,6 +182,7 @@ pub struct CmsisDap {
 
     packet_size: u16,
     packet_count: u8,
+    use_transfer_block: bool,
     capabilities: Capabilities,
     swo_buffer_size: Option<usize>,
     swo_active: bool,
@@ -267,6 +275,7 @@ impl CmsisDap {
             protocol: None,
             packet_count,
             packet_size,
+            use_transfer_block: true,
             capabilities: caps,
             swo_buffer_size,
             swo_active: false,
