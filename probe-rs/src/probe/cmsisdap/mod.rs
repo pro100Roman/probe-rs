@@ -174,7 +174,6 @@ pub struct CmsisDap {
 
     packet_size: u16,
     packet_count: u8,
-    use_transfer_block: bool,
     transfer_idle_cycles: u8,
     capabilities: Capabilities,
     swo_buffer_size: Option<usize>,
@@ -238,13 +237,6 @@ impl CmsisDap {
             );
             self.packet_count = 1;
         }
-        if tools::avoids_transfer_block(product) {
-            tracing::warn!(
-                "{product}: this firmware is incompatible with DAP_TransferBlock. \
-                 probe-rs uses DAP_Transfer instead."
-            );
-            self.use_transfer_block = false;
-        }
         if let Some(idle_cycles) = tools::transfer_idle_cycles(product) {
             tracing::warn!(
                 "{product}: probe-rs inserts {idle_cycles} idle SWD clock cycles after each transfer."
@@ -292,7 +284,6 @@ impl CmsisDap {
             protocol: None,
             packet_count,
             packet_size,
-            use_transfer_block: true,
             transfer_idle_cycles: 0,
             capabilities: caps,
             swo_buffer_size,
@@ -1446,13 +1437,12 @@ mod tests {
     }
 
     #[test]
-    fn esp32jtag_quirks_avoid_block_transfers_and_leave_swd_idle_cycles() {
+    fn esp32jtag_quirks_leave_swd_idle_cycles_without_serializing_packets() {
         let probe = FakeProbe::shared(64, |command| standard_reply(command, 64, 8));
         let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe)).unwrap();
 
         dap.apply_product_quirks(ESP32JTAG_PRODUCT);
 
-        assert!(!dap.use_transfer_block);
         assert_eq!(dap.transfer_idle_cycles, 8);
         assert_eq!(dap.packet_count, 8);
     }

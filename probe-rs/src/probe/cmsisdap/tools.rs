@@ -514,15 +514,6 @@ pub(super) fn loses_pipelined_replies(product: &str) -> bool {
     matches!(parts.as_deref(), Ok(parts) if parts < [3, 0, 0, 45].as_slice())
 }
 
-/// Whether the probe must use `DAP_Transfer` instead of `DAP_TransferBlock`.
-///
-/// ESP32JTAG's CherryDAP command path can leave a running target unresponsive during sustained
-/// block reads, even when requests are serialized and the SWD clock is reduced. Ordinary
-/// `DAP_Transfer` packets avoid that firmware path while retaining multiple accesses per packet.
-pub(super) fn avoids_transfer_block(product: &str) -> bool {
-    product == "ESP32JTAG CMSIS-DAP"
-}
-
 /// Number of idle SWD clock cycles required after every transfer for sustained traffic.
 ///
 /// ESP32JTAG otherwise drives long RTT memory reads as one uninterrupted stream of SWD accesses.
@@ -534,7 +525,7 @@ pub(super) fn transfer_idle_cycles(product: &str) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{avoids_transfer_block, loses_pipelined_replies, transfer_idle_cycles};
+    use super::{loses_pipelined_replies, transfer_idle_cycles};
 
     #[test]
     fn old_xds110_firmware_loses_pipelined_replies() {
@@ -545,12 +536,6 @@ mod tests {
             "XDS110 (03.00.00.45) Embed with CMSIS-DAP"
         ));
         assert!(!loses_pipelined_replies("DAPLink CMSIS-DAP"));
-    }
-
-    #[test]
-    fn esp32jtag_avoids_transfer_block() {
-        assert!(avoids_transfer_block("ESP32JTAG CMSIS-DAP"));
-        assert!(!avoids_transfer_block("DAPLink CMSIS-DAP"));
     }
 
     #[test]

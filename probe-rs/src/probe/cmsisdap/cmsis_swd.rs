@@ -91,7 +91,6 @@ fn split_into_packets(
     run_start: usize,
     dap_index: u8,
     packet_size: u16,
-    use_transfer_block: bool,
 ) -> impl Iterator<Item = PendingBatch> {
     let mut offset = 0;
 
@@ -108,11 +107,7 @@ fn split_into_packets(
             // it fits here, whatever follows can still share the packet; if it does not, the
             // block command takes it.
             let run = run_length(ops, offset);
-            let wanted = if use_transfer_block && run >= MIN_BLOCK_TRANSFERS {
-                run
-            } else {
-                1
-            };
+            let wanted = if run >= MIN_BLOCK_TRANSFERS { run } else { 1 };
 
             let run_items =
                 ops[offset..offset + wanted]
@@ -603,7 +598,6 @@ impl SwdProbe for CmsisDap {
                 batch_index,
                 dap_index,
                 self.packet_size,
-                self.use_transfer_block,
             );
             for packet in packets {
                 let packed = packet.transfers.len();
@@ -844,7 +838,7 @@ mod tests {
             ops.push(transfer(Port::Ap, 0b1100, Direction::Read, 0));
         }
 
-        let packets: Vec<_> = split_into_packets(&ops, 0, 0, 1024, true).collect();
+        let packets: Vec<_> = split_into_packets(&ops, 0, 0, 1024).collect();
         assert_eq!(packets[0].transfers.len(), 255);
     }
 
@@ -860,7 +854,7 @@ mod tests {
             ops.push(transfer(Port::Dp, addr, Direction::Read, 0));
         }
 
-        let packets: Vec<_> = split_into_packets(&ops, 0, 0, packet_size, true).collect();
+        let packets: Vec<_> = split_into_packets(&ops, 0, 0, packet_size).collect();
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].transfers.len(), max_per_packet);
         assert_eq!(packets[1].transfers.len(), 2);
@@ -922,7 +916,7 @@ mod tests {
 
     #[test]
     fn a_repeat_that_fits_travels_with_the_address_that_set_it_up() {
-        let packets: Vec<_> = split_into_packets(&address_then_reads(2), 0, 0, 64, true).collect();
+        let packets: Vec<_> = split_into_packets(&address_then_reads(2), 0, 0, 64).collect();
 
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].transfers.len(), 3);
@@ -932,39 +926,23 @@ mod tests {
     fn a_repeat_rides_along_until_the_reply_is_full() {
         // Three header bytes and four per read leave room for fifteen in a 64-byte reply, and the
         // address write costs the reply nothing.
-        let fits: Vec<_> = split_into_packets(&address_then_reads(15), 0, 0, 64, true).collect();
+        let fits: Vec<_> = split_into_packets(&address_then_reads(15), 0, 0, 64).collect();
         assert_eq!(fits.len(), 1);
         assert_eq!(fits[0].transfers.len(), 16);
 
-        let one_more: Vec<_> =
-            split_into_packets(&address_then_reads(16), 0, 0, 64, true).collect();
+        let one_more: Vec<_> = split_into_packets(&address_then_reads(16), 0, 0, 64).collect();
         assert_eq!(one_more.len(), 1);
         assert_eq!(one_more[0].transfers.len(), 1);
     }
 
     #[test]
     fn a_repeat_too_long_for_the_packet_is_left_to_the_block_command() {
-        let packets: Vec<_> = split_into_packets(&address_then_reads(40), 0, 0, 64, true).collect();
+        let packets: Vec<_> = split_into_packets(&address_then_reads(40), 0, 0, 64).collect();
 
         // Only the address write is packed. `run_batch` sends the reads as `DAP_TransferBlock`,
         // which is pipelined.
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].transfers.len(), 1);
-    }
-
-    #[test]
-    fn transfer_block_quirk_splits_a_long_repeat_into_transfer_packets() {
-        let packets: Vec<_> =
-            split_into_packets(&address_then_reads(40), 0, 0, 64, false).collect();
-
-        assert_eq!(packets.len(), 3);
-        assert_eq!(
-            packets
-                .iter()
-                .map(|packet| packet.transfers.len())
-                .sum::<usize>(),
-            41
-        );
     }
 
     #[test]
