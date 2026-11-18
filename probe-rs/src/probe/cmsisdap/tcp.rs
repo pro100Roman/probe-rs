@@ -37,6 +37,10 @@ const MIN_READ_TIMEOUT: Duration = Duration::from_millis(150);
 pub struct TcpDevice {
     stream: TcpStream,
     address: String,
+    /// Complete request frames waiting for the next response read. Deferring the socket write
+    /// lets pipelined `DAP_TransferBlock` commands share one TCP segment instead of producing one
+    /// small Wi-Fi packet per 64-byte CMSIS-DAP frame.
+    outgoing: Vec<u8>,
     /// Bytes received but not yet returned, at most one partial frame after a timeout.
     pending: Vec<u8>,
 }
@@ -52,6 +56,7 @@ impl TcpDevice {
                     return Ok(Self {
                         stream,
                         address: address.to_string(),
+                        outgoing: Vec::new(),
                         pending: Vec::new(),
                     });
                 }
@@ -75,7 +80,7 @@ impl TcpDevice {
         frame.extend_from_slice(&length.to_le_bytes());
         frame.extend_from_slice(&[TYPE_REQUEST, 0]);
         frame.extend_from_slice(payload);
-        self.stream.write_all(&frame)?;
+        self.outgoing.extend_from_slice(&frame);
         Ok(payload.len())
     }
 
@@ -84,6 +89,10 @@ impl TcpDevice {
     /// Fails with [`ErrorKind::TimedOut`] if no complete response arrives within `timeout`. Bytes
     /// of a partial response are kept for the next call.
     pub fn read(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+        if !self.outgoing.is_empty() {
+            self.stream.write_all(&self.outgoing)?;
+            self.outgoing.clear();
+        }
         let deadline = Instant::now() + timeout.max(MIN_READ_TIMEOUT);
         loop {
             if let Some(length) = self.take_response(buf)? {
@@ -174,6 +183,36 @@ mod test {
         frame.extend_from_slice(&[TYPE_RESPONSE, 0]);
         frame.extend_from_slice(payload);
         frame
+    }
+
+    fn request(payload: &[u8]) -> Vec<u8> {
+        let mut frame = b"DAP\0".to_vec();
+        frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&[TYPE_REQUEST, 0]);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn pipelined_requests_are_flushed_in_one_batch_before_reading() {
+        let first = request(&[0x06, 0x00, 0x01]);
+        let second = request(&[0x06, 0x00, 0x02]);
+        let expected = [first, second].concat();
+        let expected_length = expected.len();
+        let (mut device, handle) = server(move |mut stream| {
+            let mut received = vec![0; expected_length];
+            stream.read_exact(&mut received).unwrap();
+            assert_eq!(received, expected);
+            stream.write_all(&response(&[0x06, 0x01])).unwrap();
+            stream.write_all(&response(&[0x06, 0x01])).unwrap();
+        });
+
+        device.write(&[0x06, 0x00, 0x01]).unwrap();
+        device.write(&[0x06, 0x00, 0x02]).unwrap();
+        let mut buf = [0; 64];
+        assert_eq!(device.read(&mut buf, Duration::from_secs(1)).unwrap(), 2);
+        assert_eq!(device.read(&mut buf, Duration::from_secs(1)).unwrap(), 2);
+        handle.join().unwrap();
     }
 
     #[test]
